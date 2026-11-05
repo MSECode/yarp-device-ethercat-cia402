@@ -1325,6 +1325,8 @@ public:
     bool setInteractionModes(yarp::dev::InteractionModeEnum* modes) override;
 
 private:
+    // White-box tests exercise actual setters/expiry without opening EtherCAT.
+    friend struct CiA402MotionControlTestAccess;
     struct Impl;
     std::unique_ptr<Impl> m_impl;
 };

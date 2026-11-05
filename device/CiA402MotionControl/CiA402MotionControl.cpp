@@ -3,6 +3,7 @@
 
 #include "CiA402MotionControl.h"
 #include "CiA402StateMachine.h"
+#include "CstCommandWatchdog.h"
 
 #include <CiA402/EthercatManager.h>
 #include <CiA402/LogComponent.h>
@@ -189,6 +190,7 @@ struct CiA402MotionControl::Impl
         std::vector<bool> hasTorqueSP; // user provided a torque since entry?
         std::vector<bool> hasVelSP; // user provided a velocity since entry?
         std::vector<bool> hasCurrentSP; // user provided a current since entry?
+        std::vector<detail::CstCommandWatchdog> watchdogs;
 
         std::vector<double> ppJointTargetsDeg; // last requested PP target [deg] joint-side
         std::vector<int32_t> ppTargetCounts; // computed PP target for 0x607A (loop-shaft)
@@ -208,6 +210,7 @@ struct CiA402MotionControl::Impl
             hasTorqueSP.assign(n, false);
             hasVelSP.assign(n, false);
             hasCurrentSP.assign(n, false);
+            watchdogs.assign(n, detail::CstCommandWatchdog{});
 
             ppJointTargetsDeg.resize(n);
             ppTargetCounts.resize(n);
@@ -229,6 +232,7 @@ struct CiA402MotionControl::Impl
             std::fill(this->hasTorqueSP.begin(), this->hasTorqueSP.end(), false);
             std::fill(this->hasCurrentSP.begin(), this->hasCurrentSP.end(), false);
             std::fill(this->hasVelSP.begin(), this->hasVelSP.end(), false);
+            for (auto& watchdog : this->watchdogs) watchdog.disarm();
             std::fill(this->ppJointTargetsDeg.begin(), this->ppJointTargetsDeg.end(), 0.0);
             std::fill(this->ppTargetCounts.begin(), this->ppTargetCounts.end(), 0);
             std::fill(this->ppHasPosSP.begin(), this->ppHasPosSP.end(), false);
@@ -252,6 +256,7 @@ struct CiA402MotionControl::Impl
             this->motorCurrents[axis] = 0.0;
             this->hasTorqueSP[axis] = false;
             this->hasCurrentSP[axis] = false;
+            this->watchdogs[axis].disarm();
             this->ppJointTargetsDeg[axis] = 0.0;
             this->ppTargetCounts[axis] = 0;
             this->hasVelSP[axis] = false;
@@ -265,6 +270,107 @@ struct CiA402MotionControl::Impl
     };
 
     SetPoints setPoints;
+
+    double cstCommandTimeoutSec{0.0}; // Opt-in; legacy clients keep their behavior.
+    bool stopOnPdoFailure{false};
+
+    static detail::CstCommandWatchdog::Mode watchdogMode(int mode)
+    {
+        using Mode = detail::CstCommandWatchdog::Mode;
+        return mode == VOCAB_CM_TORQUE ? Mode::Torque :
+               mode == VOCAB_CM_CURRENT ? Mode::Current : Mode::Inactive;
+    }
+
+    // Caller holds BOTH mode and setpoint mutexes. Repeated faults do not log
+    // every cycle; the latch survives mode bookkeeping and late commands.
+    void stopCstLocked(std::size_t j, const char* reason)
+    {
+        const bool firstStop = controlModeState.target[j] != VOCAB_CM_IDLE;
+        setPoints.watchdogs[j].trip();
+        setPoints.jointTorques[j] = setPoints.motorCurrents[j] = 0.0;
+        setPoints.hasTorqueSP[j] = setPoints.hasCurrentSP[j] = false;
+        controlModeState.target[j] = VOCAB_CM_IDLE;
+        trqLatched[j] = currLatched[j] = false;
+        if (firstStop)
+            yCError(CIA402, "[CST watchdog] j=%zu %s; targets zeroed, IDLE requested; explicit IDLE acknowledgement required", j, reason);
+    }
+
+    void checkCstWatchdogs()
+    {
+        std::scoped_lock lock(controlModeState.mutex, setPoints.mutex);
+        const auto now = detail::CstCommandWatchdog::Clock::now();
+        for (std::size_t j = 0; j < numAxes; ++j) {
+            const bool requestedCst = watchdogMode(controlModeState.target[j]) !=
+                                     detail::CstCommandWatchdog::Mode::Inactive;
+            const auto mode = requestedCst ? watchdogMode(controlModeState.active[j]) :
+                                            detail::CstCommandWatchdog::Mode::Inactive;
+            if (setPoints.watchdogs[j].poll(mode, now))
+                stopCstLocked(j, "command expired");
+        }
+    }
+
+    void stopCstOnTransportFailure()
+    {
+        std::scoped_lock lock(controlModeState.mutex, setPoints.mutex);
+        for (std::size_t j = 0; j < numAxes; ++j)
+            if (watchdogMode(controlModeState.active[j]) != detail::CstCommandWatchdog::Mode::Inactive ||
+                watchdogMode(controlModeState.target[j]) != detail::CstCommandWatchdog::Mode::Inactive)
+                stopCstLocked(j, "PDO exchange failed");
+    }
+
+    // One acceptance path for ALL scalar/group torque and current setters.
+    // A failed batch never refreshes the lease of another axis's old target.
+    bool acceptCstTargets(int count, const int* axes, const double* values, int requiredMode)
+    {
+        if (!values || count <= 0 || count > static_cast<int>(numAxes)) return false;
+        for (int k = 0; k < count; ++k) {
+            const int j = axes ? axes[k] : k;
+            if (j < 0 || j >= static_cast<int>(numAxes) || !std::isfinite(values[k])) return false;
+        }
+        std::scoped_lock lock(controlModeState.mutex, setPoints.mutex);
+        const auto now = detail::CstCommandWatchdog::Clock::now();
+        for (int k = 0; k < count; ++k) {
+            const int j = axes ? axes[k] : k;
+            if (controlModeState.active[j] != requiredMode ||
+                controlModeState.target[j] != requiredMode ||
+                !setPoints.watchdogs[j].mayAccept(watchdogMode(requiredMode), now)) {
+                yCError(CIA402, "[CST watchdog] j=%d command rejected: mode inactive/pending or expiry latched", j);
+                return false;
+            }
+        }
+        for (int k = 0; k < count; ++k) {
+            const int j = axes ? axes[k] : k;
+            setPoints.watchdogs[j].recordAcceptedCommand(now);
+            if (requiredMode == VOCAB_CM_TORQUE) {
+                setPoints.jointTorques[j] = values[k];
+                setPoints.hasTorqueSP[j] = true;
+            } else {
+                setPoints.motorCurrents[j] = values[k];
+                setPoints.hasCurrentSP[j] = true;
+            }
+        }
+        return true;
+    }
+
+    // Caller holds BOTH mutexes. Only an explicit IDLE request clears expiry.
+    bool modeRequestAllowed(int axis, int mode) const
+    {
+        return yarpToCiaOp(mode) >= 0 &&
+               (!setPoints.watchdogs[axis].expired() ||
+                mode == VOCAB_CM_IDLE || mode == VOCAB_CM_FORCE_IDLE);
+    }
+
+    void applyModeRequestLocked(int axis, int mode)
+    {
+        if (mode == VOCAB_CM_IDLE || mode == VOCAB_CM_FORCE_IDLE) {
+            setPoints.watchdogs[axis].acknowledgeIdle();
+            setPoints.jointTorques[axis] = setPoints.motorCurrents[axis] = 0.0;
+            setPoints.hasTorqueSP[axis] = setPoints.hasCurrentSP[axis] = false;
+        }
+        controlModeState.target[axis] = mode;
+        if (mode == VOCAB_CM_TORQUE || mode == VOCAB_CM_CURRENT)
+            controlModeState.cstFlavor[axis] = mode;
+    }
 
     /* --------------- CiA-402 power-state machine ------------------------ */
     std::vector<std::unique_ptr<CiA402::StateMachine>> sm;
@@ -1068,10 +1174,18 @@ struct CiA402MotionControl::Impl
                 return false;
             }
 
-            maxMotorTorqueNm[j] = (static_cast<double>(maxPerm) / 1000.0) * ratedMotorTorqueNm[j];
+            uint16_t readback = 0;
+            if (ethercatManager.readSDO<uint16_t>(s, 0x6072, 0x00, readback)
+                    != ::CiA402::EthercatManager::Error::NoError || readback != maxPerm)
+            {
+                yCError(CIA402, "%s j=%zu cannot verify 0x6072:00 (requested=%u, readback=%u)",
+                        logPrefix, j, static_cast<unsigned>(maxPerm), static_cast<unsigned>(readback));
+                return false;
+            }
+            maxMotorTorqueNm[j] = (static_cast<double>(readback) / 1000.0) * ratedMotorTorqueNm[j];
 
             yCInfo(CIA402,
-                   "%s j=%zu configured 0x6072 to %u permille (joint=%.6f Nm, motor=%.6f Nm)",
+                   "%s j=%zu configured and VERIFIED 0x6072 to %u permille (requested_joint=%.6f Nm, motor=%.6f Nm)",
                    logPrefix,
                    j,
                    static_cast<unsigned>(maxPerm),
@@ -1118,7 +1232,7 @@ struct CiA402MotionControl::Impl
 
     bool setSetPoints()
     {
-        std::lock_guard<std::mutex> lock(this->setPoints.mutex);
+        std::scoped_lock lock(this->controlModeState.mutex, this->setPoints.mutex);
 
         /**
          * Push user setpoints into RxPDOs according to the active control mode.
@@ -1136,6 +1250,22 @@ struct CiA402MotionControl::Impl
             rx->TargetPosition = 0;
             rx->TargetTorque = 0;
             rx->TargetVelocity = 0;
+
+            const bool requestedCst = watchdogMode(controlModeState.target[j]) !=
+                                     detail::CstCommandWatchdog::Mode::Inactive;
+            const auto checkedMode = requestedCst ? watchdogMode(opMode) :
+                                                   detail::CstCommandWatchdog::Mode::Inactive;
+            if (setPoints.watchdogs[j].poll(checkedMode, detail::CstCommandWatchdog::Clock::now()))
+                stopCstLocked(j, "command expired before PDO preparation");
+
+            // Never replay a stale CST target while IDLE is pending, a fault is
+            // latched, or a torque/current flavor transition is still pending.
+            if (setPoints.watchdogs[j].expired() ||
+                controlModeState.target[j] == VOCAB_CM_IDLE ||
+                controlModeState.target[j] == VOCAB_CM_FORCE_IDLE ||
+                (watchdogMode(opMode) != detail::CstCommandWatchdog::Mode::Inactive &&
+                 controlModeState.target[j] != opMode))
+                continue;
 
             // ---------- TORQUE (CST) ----------
             if (opMode == VOCAB_CM_TORQUE)
@@ -2231,6 +2361,25 @@ bool CiA402MotionControl::open(yarp::os::Searchable& cfg)
                                                          : -1;
     const bool enableDc = cfg.check("enable_dc") ? cfg.find("enable_dc").asBool() : true;
     const int dcShiftNs = cfg.check("dc_shift_ns") ? cfg.find("dc_shift_ns").asInt32() : 0;
+    m_impl->cstCommandTimeoutSec = 0.0;
+    if (cfg.check("cst_command_timeout_s")) {
+        const auto& value = cfg.find("cst_command_timeout_s");
+        if (!value.isFloat64() && !value.isInt32()) {
+            yCError(CIA402, "%s cst_command_timeout_s must be a number", logPrefix);
+            return false;
+        }
+        m_impl->cstCommandTimeoutSec = value.asFloat64();
+    }
+    if (!std::isfinite(m_impl->cstCommandTimeoutSec) || m_impl->cstCommandTimeoutSec < 0.0 ||
+        (m_impl->cstCommandTimeoutSec > 0.0 && m_impl->cstCommandTimeoutSec <= this->getPeriod())) {
+        yCError(CIA402, "%s cst_command_timeout_s must be zero (disabled) or finite and greater than the driver period", logPrefix);
+        return false;
+    }
+    m_impl->stopOnPdoFailure = cfg.check("stop_on_pdo_failure") && cfg.find("stop_on_pdo_failure").asBool();
+    yCInfo(CIA402, "%s CST command watchdog: timeout=%.6f s, stop_on_pdo_failure=%s; expiry requires explicit IDLE acknowledgement",
+           logPrefix, m_impl->cstCommandTimeoutSec, m_impl->stopOnPdoFailure ? "true" : "false");
+    if (m_impl->cstCommandTimeoutSec == 0.0)
+        yCWarning(CIA402, "%s CST producer-command expiry is DISABLED", logPrefix);
     yCInfo(CIA402, "%s opening EtherCAT manager on interface %s", logPrefix, ifname.c_str());
 
     if (!extractListOfBoolFromSearchable(cfg,
@@ -2693,6 +2842,8 @@ bool CiA402MotionControl::open(yarp::os::Searchable& cfg)
 
     m_impl->variables.resizeContainers(m_impl->numAxes);
     m_impl->setPoints.resize(m_impl->numAxes);
+    m_impl->setPoints.watchdogs.assign(m_impl->numAxes,
+        detail::CstCommandWatchdog(m_impl->cstCommandTimeoutSec));
     m_impl->setPoints.reset();
     m_impl->controlModeState.resize(m_impl->numAxes);
     m_impl->sm.resize(m_impl->numAxes);
@@ -2894,6 +3045,9 @@ void CiA402MotionControl::run()
     // lock the mutex
     std::lock_guard<std::mutex> runGuard(m_impl->CiA402MotionControlMutex);
 
+    // An alive EtherCAT thread must not keep an absent policy's target alive.
+    m_impl->checkCstWatchdogs();
+
     /* ------------------------------------------------------------------
      * 1.  APPLY USER-REQUESTED CONTROL MODES (CiA-402 power machine)
      * ----------------------------------------------------------------*/
@@ -2960,6 +3114,9 @@ void CiA402MotionControl::run()
                 m_impl->ethercatManager.getExpectedWorkingCounter(),
                 m_impl->ethercatManager.getWorkingCounter());
         m_impl->ethercatManager.dumpDiagnostics();
+        if (m_impl->stopOnPdoFailure) m_impl->stopCstOnTransportFailure();
+        // Do not publish partially received PDOs as fresh feedback.
+        return;
     }
 
     /* ------------------------------------------------------------------
@@ -3572,7 +3729,7 @@ bool CiA402MotionControl::getControlModes(const int n, const int* joints, int* m
 
 bool CiA402MotionControl::setControlMode(const int j, const int mode)
 {
-    if (j >= static_cast<int>(m_impl->numAxes))
+    if (j < 0 || j >= static_cast<int>(m_impl->numAxes))
     {
         yCError(CIA402, "%s: joint %d out of range", Impl::kClassName.data(), j);
         return false;
@@ -3583,12 +3740,12 @@ bool CiA402MotionControl::setControlMode(const int j, const int mode)
         return false;
     }
 
-    std::lock_guard<std::mutex> l(m_impl->controlModeState.mutex);
-    m_impl->controlModeState.target[j] = mode;
-    if (mode == VOCAB_CM_CURRENT || mode == VOCAB_CM_TORQUE)
-    {
-        m_impl->controlModeState.cstFlavor[j] = mode;
+    std::scoped_lock lock(m_impl->controlModeState.mutex, m_impl->setPoints.mutex);
+    if (!m_impl->modeRequestAllowed(j, mode)) {
+        yCError(CIA402, "[CST watchdog] j=%d mode request rejected: acknowledge IDLE before re-arming", j);
+        return false;
     }
+    m_impl->applyModeRequestLocked(j, mode);
 
     return true;
 }
@@ -3605,21 +3762,18 @@ bool CiA402MotionControl::setControlModes(const int n, const int* joints, int* m
         yCError(CIA402, "%s: invalid number of joints %d", Impl::kClassName.data(), n);
         return false;
     }
-    std::lock_guard<std::mutex> l(m_impl->controlModeState.mutex);
+    std::scoped_lock lock(m_impl->controlModeState.mutex, m_impl->setPoints.mutex);
     for (int k = 0; k < n; ++k)
     {
-        if (joints[k] >= static_cast<int>(m_impl->numAxes))
+        if (joints[k] < 0 || joints[k] >= static_cast<int>(m_impl->numAxes))
         {
             yCError(CIA402, "%s: joint %d out of range", Impl::kClassName.data(), joints[k]);
             return false;
         }
-        m_impl->controlModeState.target[joints[k]] = modes[k];
-
-        if (modes[k] == VOCAB_CM_CURRENT || modes[k] == VOCAB_CM_TORQUE)
-        {
-            m_impl->controlModeState.cstFlavor[joints[k]] = modes[k];
-        }
+        if (!m_impl->modeRequestAllowed(joints[k], modes[k])) return false;
     }
+    for (int k = 0; k < n; ++k)
+        m_impl->applyModeRequestLocked(joints[k], modes[k]);
     return true;
 }
 
@@ -3630,17 +3784,11 @@ bool CiA402MotionControl::setControlModes(int* modes)
         yCError(CIA402, "%s: null pointer", Impl::kClassName.data());
         return false;
     }
-    std::lock_guard<std::mutex> l(m_impl->controlModeState.mutex);
-    std::memcpy(m_impl->controlModeState.target.data(), modes, m_impl->numAxes * sizeof(int));
-
+    std::scoped_lock lock(m_impl->controlModeState.mutex, m_impl->setPoints.mutex);
     for (size_t j = 0; j < m_impl->numAxes; ++j)
-    {
-        if (m_impl->controlModeState.target[j] == VOCAB_CM_CURRENT
-            || m_impl->controlModeState.target[j] == VOCAB_CM_TORQUE)
-        {
-            m_impl->controlModeState.cstFlavor[j] = m_impl->controlModeState.target[j];
-        }
-    }
+        if (!m_impl->modeRequestAllowed(static_cast<int>(j), modes[j])) return false;
+    for (size_t j = 0; j < m_impl->numAxes; ++j)
+        m_impl->applyModeRequestLocked(static_cast<int>(j), modes[j]);
 
     return true;
 }
@@ -3715,102 +3863,18 @@ bool CiA402MotionControl::getRefTorques(double* t)
 
 bool CiA402MotionControl::setRefTorque(int j, double t)
 {
-    if (j >= static_cast<int>(m_impl->numAxes))
-    {
-        yCError(CIA402, "%s: joint %d out of range", Impl::kClassName.data(), j);
-        return false;
-    }
-
-    // (a/b) Only accept if TORQUE is ACTIVE; otherwise reject (not considered)
-    {
-        std::lock_guard<std::mutex> g(m_impl->controlModeState.mutex);
-        if (m_impl->controlModeState.active[j] != VOCAB_CM_TORQUE)
-        {
-            yCError(CIA402,
-                    "%s: setRefTorque rejected: TORQUE mode is not active for the joint %d",
-                    Impl::kClassName.data(),
-                    j);
-            return false;
-        }
-    }
-
-    std::lock_guard<std::mutex> lock(m_impl->setPoints.mutex);
-    m_impl->setPoints.jointTorques[j] = t;
-    m_impl->setPoints.hasTorqueSP[j] = true; // (b)
-    return true;
+    return m_impl->acceptCstTargets(1, &j, &t, VOCAB_CM_TORQUE);
 }
 
 bool CiA402MotionControl::setRefTorques(const double* t)
 {
-    if (t == nullptr)
-    {
-        yCError(CIA402, "%s: null pointer", Impl::kClassName.data());
-        return false;
-    }
-    {
-        // check that all the joints are in TORQUE mode use std function without for loop
-        std::lock_guard<std::mutex> lock(m_impl->controlModeState.mutex);
-        for (size_t j = 0; j < m_impl->numAxes; ++j)
-        {
-            if (m_impl->controlModeState.active[j] != VOCAB_CM_TORQUE)
-            {
-                yCError(CIA402,
-                        "%s: setRefTorques rejected: TORQUE mode is not active for the joint "
-                        "%zu",
-                        Impl::kClassName.data(),
-                        j);
-                return false; // reject
-            }
-        }
-    }
-
-    std::lock_guard<std::mutex> lock(m_impl->setPoints.mutex);
-    std::memcpy(m_impl->setPoints.jointTorques.data(), t, m_impl->numAxes * sizeof(double));
-    std::fill(m_impl->setPoints.hasTorqueSP.begin(), m_impl->setPoints.hasTorqueSP.end(), true);
-    return true;
+    return m_impl->acceptCstTargets(static_cast<int>(m_impl->numAxes), nullptr, t, VOCAB_CM_TORQUE);
 }
 
 bool CiA402MotionControl::setRefTorques(const int n_joint, const int* joints, const double* t)
 {
-    if (t == nullptr || joints == nullptr)
-    {
-        yCError(CIA402, "%s: null pointer", Impl::kClassName.data());
-        return false;
-    }
-    if (n_joint <= 0)
-    {
-        yCError(CIA402, "%s: invalid number of joints %d", Impl::kClassName.data(), n_joint);
-        return false;
-    }
-
-    // check that all the joints are in TORQUE mode
-    {
-        std::lock_guard<std::mutex> lock(m_impl->controlModeState.mutex);
-        for (int k = 0; k < n_joint; ++k)
-        {
-            if (joints[k] >= static_cast<int>(m_impl->numAxes))
-            {
-                yCError(CIA402, "%s: joint %d out of range", Impl::kClassName.data(), joints[k]);
-                return false;
-            }
-            if (m_impl->controlModeState.active[joints[k]] != VOCAB_CM_TORQUE)
-            {
-                yCError(CIA402,
-                        "%s: setRefTorques rejected: TORQUE mode is not active for the joint %d",
-                        Impl::kClassName.data(),
-                        joints[k]);
-                return false; // reject
-            }
-        }
-    }
-
-    std::lock_guard<std::mutex> lock(m_impl->setPoints.mutex);
-    for (int k = 0; k < n_joint; ++k)
-    {
-        m_impl->setPoints.jointTorques[joints[k]] = t[k];
-        m_impl->setPoints.hasTorqueSP[joints[k]] = true;
-    }
-    return true;
+    if (!joints) return false;
+    return m_impl->acceptCstTargets(n_joint, joints, t, VOCAB_CM_TORQUE);
 }
 
 bool CiA402MotionControl::getTorqueRange(int j, double* min, double* max)
@@ -5034,113 +5098,18 @@ bool CiA402MotionControl::getCurrentRanges(double* min, double* max)
 
 bool CiA402MotionControl::setRefCurrents(const double* currs)
 {
-    if (currs == nullptr)
-    {
-        yCError(CIA402, "%s: setRefCurrents: null pointer", Impl::kClassName.data());
-        return false;
-    }
-
-    {
-        // check that all the joints are in CURRENT mode
-        std::lock_guard<std::mutex> lock(m_impl->controlModeState.mutex);
-        for (size_t j = 0; j < m_impl->numAxes; ++j)
-        {
-            if (m_impl->controlModeState.active[j] != VOCAB_CM_CURRENT)
-            {
-                yCError(CIA402,
-                        "%s: setRefCurrents rejected: CURRENT mode is not active for the joint "
-                        "%zu",
-                        Impl::kClassName.data(),
-                        j);
-                return false; // reject
-            }
-        }
-    }
-
-    std::lock_guard<std::mutex> lock(m_impl->setPoints.mutex);
-    std::memcpy(m_impl->setPoints.motorCurrents.data(), currs, m_impl->numAxes * sizeof(double));
-    std::fill(m_impl->setPoints.hasCurrentSP.begin(), m_impl->setPoints.hasCurrentSP.end(), true);
-    return true;
+    return m_impl->acceptCstTargets(static_cast<int>(m_impl->numAxes), nullptr, currs, VOCAB_CM_CURRENT);
 }
 
 bool CiA402MotionControl::setRefCurrent(int m, double curr)
 {
-    if (m < 0 || m >= static_cast<int>(m_impl->numAxes))
-    {
-        yCError(CIA402, "%s: setRefCurrent: motor %d out of range", Impl::kClassName.data(), m);
-        return false;
-    }
-
-    // (a/b) Only accept if CURRENT is ACTIVE; otherwise reject (not considered)
-    {
-        std::lock_guard<std::mutex> g(m_impl->controlModeState.mutex);
-        if (m_impl->controlModeState.active[m] != VOCAB_CM_CURRENT)
-        {
-            yCError(CIA402,
-                    "%s: setRefCurrent rejected: CURRENT mode is not active for the joint %d",
-                    Impl::kClassName.data(),
-                    m);
-            return false;
-        }
-    }
-
-    std::lock_guard<std::mutex> lock(m_impl->setPoints.mutex);
-    m_impl->setPoints.motorCurrents[m] = curr;
-    m_impl->setPoints.hasCurrentSP[m] = true; // (b)
-
-    return true;
+    return m_impl->acceptCstTargets(1, &m, &curr, VOCAB_CM_CURRENT);
 }
 
 bool CiA402MotionControl::setRefCurrents(const int n_motor, const int* motors, const double* currs)
 {
-    if (currs == nullptr || motors == nullptr)
-    {
-        yCError(CIA402, "%s: setRefCurrents: null pointer", Impl::kClassName.data());
-        return false;
-    }
-    if (n_motor <= 0)
-    {
-        yCError(CIA402,
-                "%s: setRefCurrents: invalid number of motors %d",
-                Impl::kClassName.data(),
-                n_motor);
-        return false;
-    }
-    for (int k = 0; k < n_motor; ++k)
-    {
-        if (motors[k] < 0 || motors[k] >= static_cast<int>(m_impl->numAxes))
-        {
-            yCError(CIA402,
-                    "%s: setRefCurrents: motor %d out of range",
-                    Impl::kClassName.data(),
-                    motors[k]);
-            return false;
-        }
-    }
-
-    // check that all the joints are in CURRENT mode
-    {
-        std::lock_guard<std::mutex> lock(m_impl->controlModeState.mutex);
-        for (int k = 0; k < n_motor; ++k)
-        {
-            if (m_impl->controlModeState.active[motors[k]] != VOCAB_CM_CURRENT)
-            {
-                yCError(CIA402,
-                        "%s: setRefCurrents rejected: CURRENT mode is not active for the joint %d",
-                        Impl::kClassName.data(),
-                        motors[k]);
-                return false; // reject
-            }
-        }
-    }
-
-    std::lock_guard<std::mutex> lock(m_impl->setPoints.mutex);
-    for (int k = 0; k < n_motor; ++k)
-    {
-        m_impl->setPoints.motorCurrents[motors[k]] = currs[k];
-        m_impl->setPoints.hasCurrentSP[motors[k]] = true;
-    }
-    return true;
+    if (!motors) return false;
+    return m_impl->acceptCstTargets(n_motor, motors, currs, VOCAB_CM_CURRENT);
 }
 
 bool CiA402MotionControl::getRefCurrents(double* currs)

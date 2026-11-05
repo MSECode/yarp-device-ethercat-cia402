@@ -58,6 +58,30 @@ See protocol_map.md for exact object indices and data types.
 - When `use_simple_pid_mode=false`, any `simple_pid_*` keys are ignored to avoid applying
   the simple-PID conversion rules while in cascaded PID structure.
 
+## Optional CST command-expiry protection
+
+- `cst_command_timeout_s`: monotonic host-time lease for TORQUE/CURRENT
+  commands. Zero disables it for legacy clients; a positive value must exceed
+  the driver period. Streaming controllers must resend even unchanged targets.
+- `stop_on_pdo_failure`: when true, a failed PDO exchange also latches an
+  inhibit for requested/active TORQUE/CURRENT joints. Default false.
+- On expiry or the configured transport fault, torque/current targets are
+  cleared and IDLE is requested by the EtherCAT thread. Late commands cannot
+  clear the inhibit: explicitly request IDLE/FORCE_IDLE, verify actual IDLE,
+  then deliberately re-arm. No automatic return to torque mode.
+- Mode entry has one timeout interval to receive the first command. All scalar
+  and group torque/current setters share the lease checks; invalid batches do
+  not renew old targets.
+- Startup prints the configured timeout and transport-failure setting. This
+  distinguishes an updated plugin from an older installed copy.
+- This protection requires a scheduled, running driver and working transport.
+  It is NOT a certified safety function and does not replace drive-side bus
+  watchdogs or independent STO/emergency stop. It cannot detect the death of
+  the EtherCAT process itself or eliminate WSL/USB scheduling delays.
+- Unit test: `ctest --test-dir build -R cia402_cst_command_watchdog --output-on-failure`.
+  The fake-clock tests exercise stopped/frozen producers, missing first
+  commands, deadline boundaries, transport inhibits, and explicit recovery.
+
 ## Related
 - protocol_map.md — PDO/SDO reference and conversions
 - dual_encoder_handling.md — encoder mounts, feedback selection, and shaft transforms

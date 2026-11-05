@@ -26,6 +26,7 @@ endif()
 # Defines the CMAKE_INSTALL_LIBDIR, CMAKE_INSTALL_BINDIR and many other useful macros.
 # See https://cmake.org/cmake/help/latest/module/GNUInstallDirs.html
 include(GNUInstallDirs)
+include(CTest)
 
 # Control where libraries and executables are placed during the build.
 # With the following settings executables are placed in <the top level of the
