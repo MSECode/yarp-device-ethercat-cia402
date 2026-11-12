@@ -78,9 +78,6 @@ See protocol_map.md for exact object indices and data types.
   It is NOT a certified safety function and does not replace drive-side bus
   watchdogs or independent STO/emergency stop. It cannot detect the death of
   the EtherCAT process itself or eliminate WSL/USB scheduling delays.
-- Unit test: `ctest --test-dir build -R cia402_cst_command_watchdog --output-on-failure`.
-  The fake-clock tests exercise stopped/frozen producers, missing first
-  commands, deadline boundaries, transport inhibits, and explicit recovery.
 
 ## Related
 - protocol_map.md — PDO/SDO reference and conversions
